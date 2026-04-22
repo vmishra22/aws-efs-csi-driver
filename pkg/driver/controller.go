@@ -19,6 +19,7 @@ package driver
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
@@ -38,36 +39,38 @@ import (
 )
 
 const (
-	AccessPointMode       = "efs-ap"
-	AzName                = "az"
-	BasePath              = "basePath"
-	DefaultGidMin         = int64(50000)
-	DefaultGidMax         = DefaultGidMin + cloud.AccessPointPerFsLimit
-	DefaultTagKey         = "efs.csi.aws.com/cluster"
-	DefaultTagValue       = "true"
-	DirectoryPerms        = "directoryPerms"
-	EnsureUniqueDirectory = "ensureUniqueDirectory"
-	ExternalId            = "externalId"
-	FsId                  = "fileSystemId"
-	FileSystemIdConfigRef = "fileSystemIdConfigRef"
-	FileSystemIdSecretRef = "fileSystemIdSecretRef"
-	Gid                   = "gid"
-	GidMin                = "gidRangeStart"
-	GidMax                = "gidRangeEnd"
-	MountTargetIp         = "mounttargetip"
-	ProvisioningMode      = "provisioningMode"
-	PvName                = "csi.storage.k8s.io/pv/name"
-	PvcName               = "csi.storage.k8s.io/pvc/name"
-	PvcNamespace          = "csi.storage.k8s.io/pvc/namespace"
-	RoleArn               = "awsRoleArn"
-	SubPathPattern        = "subPathPattern"
-	TempMountPathPrefix   = "/var/lib/csi/pv"
-	Uid                   = "uid"
-	ReuseAccessPointKey   = "reuseAccessPoint"
-	PvcNameKey            = "csi.storage.k8s.io/pvc/name"
-	CrossAccount          = "crossaccount"
-	ApLockWaitTimeSec     = 3
-	EnforceZoneAffinity   = "enforceZoneAffinity"
+	EFSAccessPointMode     = "efs-ap"
+	S3FilesAccessPointMode = "s3files-ap"
+	AzName                 = "az"
+	BasePath               = "basePath"
+	DefaultGidMin          = int64(50000)
+	DefaultGidMax          = DefaultGidMin + cloud.AccessPointPerFsLimit
+	DefaultTagKey          = "efs.csi.aws.com/cluster"
+	DefaultTagValue        = "true"
+	DirectoryPerms         = "directoryPerms"
+	EnsureUniqueDirectory  = "ensureUniqueDirectory"
+	ExternalId             = "externalId"
+	FsId                   = "fileSystemId"
+	FileSystemIdConfigRef  = "fileSystemIdConfigRef"
+	FileSystemIdSecretRef  = "fileSystemIdSecretRef"
+	Gid                    = "gid"
+	GidMin                 = "gidRangeStart"
+	GidMax                 = "gidRangeEnd"
+	MountTargetIp          = "mounttargetip"
+	MountTargetIpMap       = "mounttargetipmap"
+	ProvisioningMode       = "provisioningMode"
+	PvName                 = "csi.storage.k8s.io/pv/name"
+	PvcName                = "csi.storage.k8s.io/pvc/name"
+	PvcNamespace           = "csi.storage.k8s.io/pvc/namespace"
+	RoleArn                = "awsRoleArn"
+	SubPathPattern         = "subPathPattern"
+	TempMountPathPrefix    = "/var/lib/csi/pv"
+	Uid                    = "uid"
+	ReuseAccessPointKey    = "reuseAccessPoint"
+	PvcNameKey             = "csi.storage.k8s.io/pvc/name"
+	CrossAccount           = "crossaccount"
+	ApLockWaitTimeSec      = 3
+	EnforceZoneAffinity    = "enforceZoneAffinity"
 )
 
 var (
@@ -145,20 +148,10 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		roleArn                string
 		uid                    int64
 		crossAccountDNSEnabled bool
+		fsType                 util.FileSystemType
 	)
 
 	//Parse parameters
-	if value, ok := volumeParams[ProvisioningMode]; ok {
-		provisioningMode = value
-		//TODO: Add FS provisioning mode check when implemented
-		if provisioningMode != AccessPointMode {
-			errStr := "Provisioning mode " + provisioningMode + " is not supported. Only Access point provisioning: 'efs-ap' is supported"
-			return nil, status.Error(codes.InvalidArgument, errStr)
-		}
-	} else {
-		return nil, status.Errorf(codes.InvalidArgument, "Missing %v parameter", ProvisioningMode)
-	}
-
 	accessPointsOptions := &cloud.AccessPointOptions{
 		CapacityGiB: volSize,
 	}
@@ -167,7 +160,41 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	if err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "Failed to resolve filesystem Id %v", err)
 	}
+
 	accessPointsOptions.FileSystemId = value
+
+	if value, ok := volumeParams[ProvisioningMode]; ok {
+		provisioningMode = value
+		//TODO: Add FS provisioning mode check when implemented
+		switch provisioningMode {
+		case EFSAccessPointMode:
+			fsType = util.FileSystemTypeEFS
+		case S3FilesAccessPointMode:
+			fsType = util.FileSystemTypeS3Files
+		default:
+			errStr := "Provisioning mode " + provisioningMode + " is not supported. Only Access point provisioning 'efs-ap' or 's3files-ap' are supported"
+			return nil, status.Error(codes.InvalidArgument, errStr)
+		}
+	} else {
+		return nil, status.Errorf(codes.InvalidArgument, "Missing %v parameter", ProvisioningMode)
+	}
+
+	// if true, then use sha256 hash of pvcName as clientToken instead of PVC Id
+	// This allows users to reconnect to the same AP from different k8s cluster
+	if reuseAccessPointStr, ok := volumeParams[ReuseAccessPointKey]; ok {
+		if fsType == util.FileSystemTypeS3Files {
+			return nil, status.Errorf(codes.InvalidArgument, "Parameter %v is only supported for EFS file systems, not supported for %v file systems", ReuseAccessPointKey, fsType)
+		}
+
+		reuseAccessPoint, err = strconv.ParseBool(reuseAccessPointStr)
+		if err != nil {
+			return nil, status.Error(codes.InvalidArgument, "Invalid value for reuseAccessPoint parameter")
+		}
+		if reuseAccessPoint {
+			clientToken = get64LenHash(volumeParams[PvcNameKey])
+			klog.V(5).Infof("Client token : %s", clientToken)
+		}
+	}
 
 	localCloud, roleArn, crossAccountDNSEnabled, err = getCloud(req.GetSecrets(), d)
 	if err != nil {
@@ -178,7 +205,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	//if reuseAccessPoint is true, check for AP with same Root Directory exists in efs
 	// if found reuse that AP
 	if reuseAccessPoint {
-		existingAP, err := localCloud.FindAccessPointByClientToken(ctx, clientToken, accessPointsOptions.FileSystemId)
+		existingAP, err := localCloud.FindAccessPointByClientToken(ctx, clientToken, accessPointsOptions.FileSystemId, fsType)
 		if err != nil {
 			return nil, fmt.Errorf("failed to find access point: %v", err)
 		}
@@ -280,19 +307,18 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 			accessPointsOptions.DirectoryPerms = value
 		}
 
-		// Storage class parameter `az` will be used to fetch preferred mount target for cross account mount.
-		// If the `az` storage class parameter is not provided, a random mount target will be picked for mounting.
-		// This storage class parameter different from `az` mount option provided by efs-utils https://github.com/aws/efs-utils/blob/v1.31.1/src/mount_efs/__init__.py#L195
-		// The `az` mount option provided by efs-utils is used for cross az mount or to provide az of efs one zone file system mount within the same aws-account.
-		// To make use of the `az` mount option, add it under storage class's `mountOptions` section. https://kubernetes.io/docs/concepts/storage/storage-classes/#mount-options
+		// Storage class parameter `az` selects a specific AZ's mount target for cross-account mount
 		if value, ok := volumeParams[AzName]; ok {
+			if fsType != util.FileSystemTypeEFS {
+				return nil, status.Errorf(codes.InvalidArgument, "Parameter %v is only supported for EFS file systems, not supported for %v file systems", AzName, fsType)
+			}
 			azName = value
 		}
 
 		// With dynamic uid/gid provisioning we can save a call to describe FS, as list APs fails if FS ID does not exist
 		var accessPoints []*cloud.AccessPoint
 		if uid == -1 || gid == -1 {
-			accessPoints, err = localCloud.ListAccessPoints(ctx, accessPointsOptions.FileSystemId)
+			accessPoints, err = localCloud.ListAccessPoints(ctx, accessPointsOptions.FileSystemId, fsType)
 		}
 		if err != nil {
 			if err == cloud.ErrAccessDenied {
@@ -349,22 +375,23 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 		}
 
 		rootDir := path.Join("/", basePath, rootDirName)
-		if ok, err := validateEfsPathRequirements(rootDir); !ok {
+		if ok, err := validatePathRequirements(rootDir); !ok {
 			return nil, err
 		}
+
 		klog.Infof("Using %v as the access point directory.", rootDir)
 
 		accessPointsOptions.Uid = uid
 		accessPointsOptions.Gid = gid
 		accessPointsOptions.DirectoryPath = rootDir
 
-		accessPoint, err = localCloud.CreateAccessPoint(ctx, clientToken, accessPointsOptions)
+		accessPoint, err = localCloud.CreateAccessPoint(ctx, clientToken, accessPointsOptions, fsType)
 		if err != nil {
 			if err == cloud.ErrAccessDenied {
 				return nil, status.Errorf(codes.Unauthenticated, "Access Denied. Please ensure you have the right AWS permissions: %v", err)
 			} else if err == cloud.ErrAlreadyExists {
 				klog.V(4).Infof("Access point already exists for client token %s. Retrieving existing access point details.", clientToken)
-				existingAccessPoint, err := localCloud.FindAccessPointByClientToken(ctx, clientToken, accessPointsOptions.FileSystemId)
+				existingAccessPoint, err := localCloud.FindAccessPointByClientToken(ctx, clientToken, accessPointsOptions.FileSystemId, fsType)
 				if err != nil {
 					return nil, fmt.Errorf("Error attempting to retrieve existing access point for client token %s: %v", clientToken, err)
 				}
@@ -391,20 +418,31 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 
 	volContext := map[string]string{}
 
-	// Enable cross-account dns resolution or fetch mount target Ip for cross-account mount
-	if roleArn != "" {
-		if crossAccountDNSEnabled {
-			// This option indicates the customer would like to use DNS to resolve
-			// the cross-account mount target ip address (in order to mount to
-			// the same AZ-ID as the client instance); mounttargetip should
-			// not be used as a mount option in this case.
-			volContext[CrossAccount] = strconv.FormatBool(true)
-		} else {
-			mountTarget, err := localCloud.DescribeMountTargets(ctx, accessPointsOptions.FileSystemId, azName)
-			if err != nil {
-				klog.Warningf("Failed to describe mount targets for file system %v. Skip using `mounttargetip` mount option: %v", accessPointsOptions.FileSystemId, err)
+	if fsType == util.FileSystemTypeEFS {
+		// Enable cross-account dns resolution or fetch mount target Ip for cross-account mount
+		if roleArn != "" {
+			if crossAccountDNSEnabled {
+				// This option indicates the customer would like to use DNS to resolve
+				// the cross-account mount target ip address (in order to mount to
+				// the same AZ-ID as the client instance); mounttargetip should
+				// not be used as a mount option in this case.
+				volContext[CrossAccount] = strconv.FormatBool(true)
+			} else if azName != "" {
+				// Use the specified AZ's mount target rather than picking randomly.
+				mountTarget, err := localCloud.DescribeMountTargets(ctx, accessPointsOptions.FileSystemId, azName, fsType)
+				if err != nil {
+					klog.Warningf("Failed to describe mount targets for file system %v. Consider using crossaccount=true for DNS-based resolution: %v", accessPointsOptions.FileSystemId, err)
+				} else {
+					volContext[MountTargetIp] = mountTarget.IPAddress
+				}
 			} else {
-				volContext[MountTargetIp] = mountTarget.IPAddress
+				// No az specified and crossaccount DNS disabled: fetch all mount targets
+				// and pass the AZ→IP map so each node can pick its own AZ's mount target.
+				if ipMapJSON, err := buildMountTargetIPMap(ctx, localCloud, accessPointsOptions.FileSystemId); err != nil {
+					klog.Warningf("Failed to build mount target IP map for file system %v: %v", accessPointsOptions.FileSystemId, err)
+				} else {
+					volContext[MountTargetIpMap] = ipMapJSON
+				}
 			}
 
 		}
@@ -415,7 +453,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	var fsInfo *cloud.FileSystem
 
 	if enforceZoneAffinity {
-		fsInfo, err = localCloud.DescribeFileSystem(ctx, accessPointsOptions.FileSystemId)
+		fsInfo, err = localCloud.DescribeFileSystem(ctx, accessPointsOptions.FileSystemId, fsType)
 		if err != nil {
 			klog.Errorf("Failed to describe file system %v: %v", accessPointsOptions.FileSystemId, err)
 			if err == cloud.ErrAccessDenied {
@@ -435,7 +473,7 @@ func (d *Driver) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest)
 	return &csi.CreateVolumeResponse{
 		Volume: &csi.Volume{
 			CapacityBytes:      volSize,
-			VolumeId:           accessPointsOptions.FileSystemId + "::" + accessPoint.AccessPointId,
+			VolumeId:           fsType.String() + ":" + accessPointsOptions.FileSystemId + "::" + accessPoint.AccessPointId,
 			VolumeContext:      volContext,
 			AccessibleTopology: topology,
 		},
@@ -461,7 +499,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 		return nil, status.Error(codes.InvalidArgument, "Volume ID not provided")
 	}
 
-	fileSystemId, _, accessPointId, err := parseVolumeId(volId)
+	fileSystemId, _, accessPointId, fsType, err := parseVolumeId(volId)
 	if err != nil {
 		//Returning success for an invalid volume ID. See here - https://github.com/kubernetes-csi/csi-test/blame/5deb83d58fea909b2895731d43e32400380aae3c/pkg/sanity/controller.go#L733
 		klog.V(5).Infof("DeleteVolume: Failed to parse volumeID: %v, err: %v, returning success", volId, err)
@@ -512,7 +550,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 
 		// Check if Access point exists.
 		// If access point exists, retrieve its root directory and delete it/
-		accessPoint, err := localCloud.DescribeAccessPoint(ctx, accessPointId)
+		accessPoint, err := localCloud.DescribeAccessPoint(ctx, accessPointId, fileSystemId, fsType)
 		if err != nil {
 			if err == cloud.ErrAccessDenied {
 				return nil, status.Errorf(codes.Unauthenticated, "Access Denied. Please ensure you have the right AWS permissions: %v", err)
@@ -526,16 +564,21 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 
 		//Mount File System at it root and delete access point root directory
 		mountOptions := []string{"tls", "iam"}
-		if roleArn != "" {
-			if crossAccountDNSEnabled {
-				// Connect via dns rather than mounttargetip
-				mountOptions = append(mountOptions, CrossAccount)
-			} else {
-				mountTarget, err := localCloud.DescribeMountTargets(ctx, fileSystemId, "")
-				if err == nil {
-					mountOptions = append(mountOptions, MountTargetIp+"="+mountTarget.IPAddress)
+		if fsType == util.FileSystemTypeEFS {
+			if roleArn != "" {
+				if crossAccountDNSEnabled {
+					// Connect via dns rather than mounttargetip
+					mountOptions = append(mountOptions, CrossAccount)
 				} else {
-					klog.Warningf("Failed to describe mount targets for file system %v. Skip using `mounttargetip` mount option: %v", fileSystemId, err)
+					// No crossaccount DNS: resolve a mount target IP via the cross-account role
+					// so the controller can mount the filesystem for access point cleanup.
+					// Prefer the controller's own AZ for lower latency, fall back to any available.
+					mountTargets, err := localCloud.DescribeAvailableMountTargets(ctx, fileSystemId)
+					if err != nil {
+						klog.Warningf("DeleteVolume: failed to describe mount targets for %v: %v", fileSystemId, err)
+					} else if ip := selectMountTargetIP(mountTargets, d.cloud.GetMetadata().GetAvailabilityZone()); ip != "" {
+						mountOptions = append(mountOptions, MountTargetIp+"="+ip)
+					}
 				}
 			}
 		}
@@ -551,7 +594,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 			return nil, status.Errorf(codes.Internal, "Could not check if %q is mounted: %v", fsRoot, err)
 		}
 		if isNotMounted {
-			if err := d.mounter.Mount(fileSystemId, fsRoot, "efs", mountOptions); err != nil {
+			if err := d.mounter.Mount(fileSystemId, fsRoot, fsType.String(), mountOptions); err != nil {
 				return nil, status.Errorf(codes.Internal, "Could not mount %q at %q: %v", fileSystemId, fsRoot, err)
 			}
 		}
@@ -578,7 +621,7 @@ func (d *Driver) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest)
 	}
 
 	// Delete access point
-	if err = localCloud.DeleteAccessPoint(ctx, accessPointId); err != nil {
+	if err = localCloud.DeleteAccessPoint(ctx, accessPointId, fsType); err != nil {
 		if err == cloud.ErrAccessDenied {
 			return nil, status.Errorf(codes.Unauthenticated, "Access Denied. Please ensure you have the right AWS permissions: %v", err)
 		}
@@ -612,7 +655,7 @@ func (d *Driver) ValidateVolumeCapabilities(ctx context.Context, req *csi.Valida
 		return nil, status.Error(codes.InvalidArgument, "Volume capabilities not provided")
 	}
 
-	_, _, _, err := parseVolumeId(volId)
+	_, _, _, _, err := parseVolumeId(volId)
 	if err != nil {
 		return nil, status.Errorf(codes.NotFound, "Volume not found, err: %v", err)
 	}
@@ -736,6 +779,38 @@ func createListOfVariableSubstitutions(volumeParams map[string]string) []string 
 	return variableSubstitutions
 }
 
+// buildMountTargetIPMap fetches all available mount targets and returns a JSON-encoded AZ→IP map.
+func buildMountTargetIPMap(ctx context.Context, c cloud.Cloud, fileSystemId string) (string, error) {
+	mountTargets, err := c.DescribeAvailableMountTargets(ctx, fileSystemId)
+	if err != nil {
+		return "", err
+	}
+	ipMap := make(map[string]string, len(mountTargets))
+	for _, mt := range mountTargets {
+		ipMap[mt.AZName] = mt.IPAddress
+	}
+	jsonBytes, err := json.Marshal(ipMap)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal mount target IP map: %v", err)
+	}
+	return string(jsonBytes), nil
+}
+
+// selectMountTargetIP picks the mount target IP for the given preferredAZ.
+// If no mount target exists in the preferred AZ, it falls back to any available mount target.
+func selectMountTargetIP(mountTargets []*cloud.MountTarget, preferredAZ string) string {
+	if len(mountTargets) == 0 {
+		return ""
+	}
+	for _, mt := range mountTargets {
+		if mt.AZName == preferredAZ {
+			return mt.IPAddress
+		}
+	}
+	// Fall back to first available mount target
+	return mountTargets[0].IPAddress
+}
+
 func getSupportedComponentNames() []string {
 	keys := make([]string, len(subPathPatternComponents))
 
@@ -748,13 +823,13 @@ func getSupportedComponentNames() []string {
 	return keys
 }
 
-func validateEfsPathRequirements(proposedPath string) (bool, error) {
+func validatePathRequirements(proposedPath string) (bool, error) {
 	if len(proposedPath) > 100 {
 		// Check the proposed path is 100 characters or fewer
-		return false, status.Errorf(codes.InvalidArgument, "Proposed path '%s' exceeds EFS limit of 100 characters", proposedPath)
+		return false, status.Errorf(codes.InvalidArgument, "Proposed path '%s' exceeds file system limit of 100 characters", proposedPath)
 	} else if strings.Count(proposedPath, "/") > 5 {
 		// Check the proposed path contains at most 4 subdirectories
-		return false, status.Errorf(codes.InvalidArgument, "Proposed path '%s' EFS limit of 4 subdirectories", proposedPath)
+		return false, status.Errorf(codes.InvalidArgument, "Proposed path '%s' file system limit of 4 subdirectories", proposedPath)
 	} else {
 		return true, nil
 	}
